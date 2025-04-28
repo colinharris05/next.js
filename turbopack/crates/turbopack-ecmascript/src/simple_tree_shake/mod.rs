@@ -3,11 +3,8 @@
 use anyhow::{bail, Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 use turbo_rcstr::RcStr;
-use turbo_tasks::{ResolvedVc, TryJoinIterExt, Vc};
-use turbopack_core::{
-    module_graph::{ModuleGraph, SingleModuleGraph},
-    resolve::ExportUsage,
-};
+use turbo_tasks::{ResolvedVc, ValueToString, Vc};
+use turbopack_core::{module::Module, module_graph::ModuleGraph, resolve::ExportUsage};
 
 use crate::chunk::EcmascriptChunkPlaceable;
 
@@ -24,7 +21,9 @@ pub async fn get_module_export_usages(
 
     let Some(exports) = export_usage_info.used_exports.get(&module) else {
         bail!(
-            "module not found in export usage info. Something is wrong with the export usage info."
+            "module {} not found in export usage info. Something is wrong with the export usage \
+             info.",
+            module.ident().to_string().await?
         );
     };
 
@@ -36,49 +35,24 @@ pub async fn get_module_export_usages(
 
 #[turbo_tasks::function(operation)]
 async fn compute_export_usage_info(graph: ResolvedVc<ModuleGraph>) -> Result<Vc<ExportUsageInfo>> {
-    let results = graph
-        .await?
-        .graphs
-        .iter()
-        .map(|g| compute_export_usage_info_single(**g))
-        .try_join()
-        .await?;
-
-    let mut result = ExportUsageInfo::default();
-
-    for item in results {
-        for (k, v) in &item.await?.used_exports {
-            result.used_exports.entry(*k).or_default().extend(v.clone());
-        }
-    }
-
-    Ok(result.cell())
-}
-
-pub async fn compute_export_usage_info_single(
-    graph: Vc<SingleModuleGraph>,
-) -> Result<Vc<ExportUsageInfo>> {
-    let graph = graph.await?;
     let mut usage = ExportUsageInfo::default();
 
-    // Traverse the module graph
-
     graph
-        .traverse_edges(|(edge, target)| {
+        .await?
+        .traverse_all_edges_unordered(|(_, edge), target| {
             if let Some(target_module) =
                 ResolvedVc::try_downcast::<Box<dyn EcmascriptChunkPlaceable>>(target.module)
             {
-                if let Some((_, ref_data)) = edge {
-                    usage
-                        .used_exports
-                        .entry(ResolvedVc::upcast(target_module))
-                        .or_default()
-                        .insert(ref_data.export.clone());
-                }
+                usage
+                    .used_exports
+                    .entry(ResolvedVc::upcast(target_module))
+                    .or_default()
+                    .insert(edge.export.clone());
             }
 
-            turbopack_core::module_graph::GraphTraversalAction::Continue
+            Ok(())
         })
+        .await
         .context("failed to traverse module graph")?;
 
     Ok(usage.cell())
